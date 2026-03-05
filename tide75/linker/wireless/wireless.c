@@ -14,11 +14,15 @@
 #endif
 
 #ifndef WLS_POSTSLEEP_RESYNC_DELAY
-#    define WLS_POSTSLEEP_RESYNC_DELAY 50
+#    define WLS_POSTSLEEP_RESYNC_DELAY 15
 #endif
 
 #ifndef WLS_POSTSLEEP_RESYNC_COUNT
-#    define WLS_POSTSLEEP_RESYNC_COUNT 30
+#    define WLS_POSTSLEEP_RESYNC_COUNT 80
+#endif
+
+#ifndef WLS_POSTSLEEP_GATE_MS
+#    define WLS_POSTSLEEP_GATE_MS 100
 #endif
 
 static uint8_t wls_devs = DEVS_USB;
@@ -28,6 +32,9 @@ static uint32_t keepalive_timer = 0;
 static bool     postsleep_resync = false;
 static uint32_t postsleep_timer  = 0;
 static uint8_t  postsleep_count  = 0;
+
+static bool     postsleep_gate       = false;
+static uint32_t postsleep_gate_timer = 0;
 
 void last_matrix_activity_trigger(void);
 
@@ -72,13 +79,41 @@ void wireless_send_keyboard(report_keyboard_t *report) {
      * radio link is cold.  The first report will likely be lost during
      * radio/USB re-establishment.  Schedule aggressive resyncs to
      * re-deliver the keyboard state once the link is warm.
-     * 1500ms of coverage (30 × 50ms) handles even slow USB resume.
+     * 1200ms of coverage (80 × 15ms) handles even slow USB resume.
+     *
+     * Guard with !postsleep_resync so subsequent calls (including those
+     * triggered by the resync itself via host_keyboard_send) don't reset
+     * the counter and timer.  Without this guard the counter never
+     * advances during the 200ms LPWR_WAKEUP window.
      */
     lpwr_state_t state = lpwr_get_state();
-    if (state == LPWR_WAKEUP || state == LPWR_STOP || state == LPWR_PRESLEEP) {
+    if ((state == LPWR_WAKEUP || state == LPWR_STOP || state == LPWR_PRESLEEP)
+        && !postsleep_resync) {
         postsleep_resync = true;
         postsleep_count  = 0;
         postsleep_timer  = sync_timer_read32();
+    }
+
+    /* Post-sleep gate: suppress radio sends while the 2.4GHz link is cold.
+     *
+     * After waking from sleep the radio module needs ~60-80ms to
+     * re-establish the link to the dongle.  Reports sent during this
+     * cold window are ACK'd by the module (UART level) but lost or
+     * corrupted over the air — causing modifier drops (e.g. Cmd+Shift+4
+     * registers as Shift+4 = '$').
+     *
+     * The gate prevents any md_send_kb() calls for WLS_POSTSLEEP_GATE_MS
+     * (100ms) after wake.  The main loop runs freely during this time,
+     * so keyboard_task() still scans the matrix and updates the global
+     * keyboard_report.  When the gate lifts in wireless_task(), the
+     * accumulated report (with all modifiers) is delivered to a warm
+     * radio link.
+     *
+     * The postsleep_resync mechanism (armed above) provides 1200ms of
+     * continued re-delivery as additional insurance.
+     */
+    if (postsleep_gate) {
+        return;
     }
 
     if (report != NULL) {
@@ -160,26 +195,35 @@ void wireless_send_nkro(report_nkro_t *report) {
 
     wireless_driver.send_keyboard(&temp_report_keyboard);
 
-    /* Only send the NKRO overflow bitmap when it actually contains key
-     * data (i.e. more than 6 keys are pressed simultaneously).
+    /* Skip the NKRO overflow during post-sleep resync.
      *
-     * For normal typing (≤6 keys), the NKRO bitmap is all zeros.
-     * Sending that empty 0xA2 message after the 6KRO 0xA1 message
-     * creates a race on the dongle: both arrive close together and
-     * the empty NKRO can overwrite the 6KRO state (including
-     * modifiers) within the same USB poll interval, causing the host
-     * to see only the key release.  Skipping the empty NKRO
-     * eliminates this race entirely.
+     * The 0xA2 NKRO message contains only the key bitmap (no modifiers).
+     * During the radio warm-up window the 0xA1 (6KRO, with modifiers) and
+     * 0xA2 (NKRO, without modifiers) arrive as separate radio packets.
+     * If the dongle processes the 0xA2 after the 0xA1, it overwrites the
+     * modifier state — causing e.g. Cmd+Shift+4 to register as Shift+4
+     * ('$') with Cmd lost.
+     *
+     * During the resync window, send ONLY the 6KRO message which contains
+     * both modifiers and up to 6 keycodes.  This is sufficient for all
+     * modifier-based shortcuts.  Full NKRO resumes after the resync
+     * window closes (~1200ms).
+     *
+     * Outside the resync window, only send the NKRO overflow when the
+     * bitmap actually contains data (>6 keys pressed).  An empty 0xA2
+     * can still overwrite 6KRO modifier state on the dongle.
      */
-    bool has_nkro_overflow = false;
-    for (uint8_t i = 0; i < MD_SND_CMD_NKRO_LEN; i++) {
-        if (wls_report_nkro[i]) {
-            has_nkro_overflow = true;
-            break;
+    if (!postsleep_resync) {
+        bool has_nkro_overflow = false;
+        for (uint8_t i = 0; i < MD_SND_CMD_NKRO_LEN; i++) {
+            if (wls_report_nkro[i]) {
+                has_nkro_overflow = true;
+                break;
+            }
         }
-    }
-    if (has_nkro_overflow) {
-        md_send_nkro(wls_report_nkro);
+        if (has_nkro_overflow) {
+            md_send_nkro(wls_report_nkro);
+        }
     }
 }
 
@@ -265,6 +309,11 @@ uint8_t wireless_get_current_devs(void) {
     return wls_devs;
 }
 
+void wireless_set_postsleep_gate(void) {
+    postsleep_gate       = true;
+    postsleep_gate_timer = sync_timer_read32();
+}
+
 void wireless_pre_task(void) __attribute__((weak));
 void wireless_pre_task(void) {}
 
@@ -277,6 +326,30 @@ void wireless_task(void) {
     lpwr_task();
     md_main_task();
     wireless_post_task();
+
+    /* Post-sleep gate expiry: once the radio has had enough time to
+     * warm up, lift the gate so the next keyboard_task() can deliver
+     * the report through its normal path (which correctly sets
+     * modifier state via get_mods_for_report()).
+     *
+     * We do NOT send directly here — keyboard_task() knows whether
+     * to use the 6KRO or NKRO path and sets the modifier byte in
+     * the correct report object.  Sending directly from here risks
+     * a path mismatch (e.g. NKRO active but reading 6KRO report
+     * whose mods were never populated).
+     *
+     * Invalidate BOTH dedup caches so the next keyboard_task()
+     * is guaranteed to send regardless of which protocol is active.
+     */
+    if (postsleep_gate &&
+        sync_timer_elapsed32(postsleep_gate_timer) >= WLS_POSTSLEEP_GATE_MS) {
+        postsleep_gate = false;
+
+        keyboard_report_dedup_invalidate();
+#ifdef NKRO_ENABLE
+        nkro_report_dedup_invalidate();
+#endif
+    }
 
     /* Resync after module reconnection.
      * When reports are dropped because the module was not connected,

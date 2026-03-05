@@ -4,8 +4,10 @@
     "maintainer": "sdk66",
     "bootloader": "wb32-dfu",
     "bootmagic": {
+        "enabled": true,
         "matrix": [0, 0]
     },
+    "debounce": 8,
     "diode_direction": "ROW2COL",
     "encoder": {
         "rotary": [
@@ -164,7 +166,7 @@
     "url": "",
     "usb": {
         "device_version": "0.0.1",
-        "force_nkro": true,
+        "force_nkro": false,
         "pid": "0xE471",
         "suspend_wakeup_delay": 1000,
         "vid": "0x342D"
