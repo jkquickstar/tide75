@@ -120,15 +120,21 @@ void usb_remote_wakeup(void) {
     }
 #else
     static uint32_t suspend_timer = 0x00;
+    static bool suspended = false;
 
     if ((USB_DRIVER.state == USB_SUSPENDED)) {
         if (!suspend_timer) suspend_timer = sync_timer_read32();
         if (sync_timer_elapsed32(suspend_timer) >= USB_POWER_DOWN_DELAY) {
             suspend_timer = 0x00;
+            suspended = true;
             suspend_power_down();
         }
     } else {
         suspend_timer = 0x00;
+        if (suspended) {
+            suspended = false;
+            suspend_wakeup_init();
+        }
     }
 #endif
 }

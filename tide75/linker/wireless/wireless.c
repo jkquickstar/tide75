@@ -9,7 +9,25 @@
 #    define WLS_INQUIRY_BAT_TIME 3000
 #endif
 
+#ifndef WLS_KEEPALIVE_INTERVAL
+#    define WLS_KEEPALIVE_INTERVAL 1000
+#endif
+
+#ifndef WLS_POSTSLEEP_RESYNC_DELAY
+#    define WLS_POSTSLEEP_RESYNC_DELAY 50
+#endif
+
+#ifndef WLS_POSTSLEEP_RESYNC_COUNT
+#    define WLS_POSTSLEEP_RESYNC_COUNT 30
+#endif
+
 static uint8_t wls_devs = DEVS_USB;
+static bool report_dropped      = false;
+static uint32_t keepalive_timer = 0;
+
+static bool     postsleep_resync = false;
+static uint32_t postsleep_timer  = 0;
+static uint8_t  postsleep_count  = 0;
 
 void last_matrix_activity_trigger(void);
 
@@ -45,8 +63,22 @@ void wireless_send_keyboard(report_keyboard_t *report) {
     uint8_t wls_report_kb[MD_SND_CMD_KB_LEN] = {0};
 
     if (*md_getp_state() != MD_STATE_CONNECTED) {
+        report_dropped = true;
         wireless_devs_change(wls_devs, wls_devs, false);
         return;
+    }
+
+    /* When waking from sleep (or during presleep/stop transitions) the
+     * radio link is cold.  The first report will likely be lost during
+     * radio/USB re-establishment.  Schedule aggressive resyncs to
+     * re-deliver the keyboard state once the link is warm.
+     * 1500ms of coverage (30 × 50ms) handles even slow USB resume.
+     */
+    lpwr_state_t state = lpwr_get_state();
+    if (state == LPWR_WAKEUP || state == LPWR_STOP || state == LPWR_PRESLEEP) {
+        postsleep_resync = true;
+        postsleep_count  = 0;
+        postsleep_timer  = sync_timer_read32();
     }
 
     if (report != NULL) {
@@ -60,6 +92,7 @@ void wireless_send_nkro(report_nkro_t *report) {
     uint8_t wls_report_nkro[MD_SND_CMD_NKRO_LEN]  = {0};
 
     if (*md_getp_state() != MD_STATE_CONNECTED) {
+        report_dropped = true;
         wireless_devs_change(wls_devs, wls_devs, false);
         return;
     }
@@ -126,7 +159,28 @@ void wireless_send_nkro(report_nkro_t *report) {
     }
 
     wireless_driver.send_keyboard(&temp_report_keyboard);
-    md_send_nkro(wls_report_nkro);
+
+    /* Only send the NKRO overflow bitmap when it actually contains key
+     * data (i.e. more than 6 keys are pressed simultaneously).
+     *
+     * For normal typing (≤6 keys), the NKRO bitmap is all zeros.
+     * Sending that empty 0xA2 message after the 6KRO 0xA1 message
+     * creates a race on the dongle: both arrive close together and
+     * the empty NKRO can overwrite the 6KRO state (including
+     * modifiers) within the same USB poll interval, causing the host
+     * to see only the key release.  Skipping the empty NKRO
+     * eliminates this race entirely.
+     */
+    bool has_nkro_overflow = false;
+    for (uint8_t i = 0; i < MD_SND_CMD_NKRO_LEN; i++) {
+        if (wls_report_nkro[i]) {
+            has_nkro_overflow = true;
+            break;
+        }
+    }
+    if (has_nkro_overflow) {
+        md_send_nkro(wls_report_nkro);
+    }
 }
 
 void wireless_send_mouse(report_mouse_t *report) {
@@ -223,6 +277,101 @@ void wireless_task(void) {
     lpwr_task();
     md_main_task();
     wireless_post_task();
+
+    /* Resync after module reconnection.
+     * When reports are dropped because the module was not connected,
+     * QMK's report dedup cache still considers them "sent."  Invalidate
+     * the cache and force a resend.
+     */
+    if (report_dropped && *md_getp_state() == MD_STATE_CONNECTED) {
+        report_dropped = false;
+        keepalive_timer = sync_timer_read32();
+
+#ifdef NKRO_ENABLE
+        extern keymap_config_t keymap_config;
+        if (keyboard_protocol && keymap_config.nkro) {
+            nkro_report_dedup_invalidate();
+        } else
+#endif
+        {
+            keyboard_report_dedup_invalidate();
+        }
+
+        extern report_keyboard_t *keyboard_report;
+#ifdef NKRO_ENABLE
+        extern report_nkro_t *nkro_report;
+        if (keyboard_protocol && keymap_config.nkro) {
+            host_nkro_send(nkro_report);
+        } else
+#endif
+        {
+            host_keyboard_send(keyboard_report);
+        }
+    }
+
+    /* Post-sleep resync: force-resend keyboard state at 100ms intervals
+     * after waking from sleep.  The first report is sent immediately by
+     * wireless_send_keyboard() but is typically lost while the radio/USB
+     * link re-establishes.  These resyncs re-deliver the state once the
+     * link is warm.
+     */
+    if (postsleep_resync && *md_getp_state() == MD_STATE_CONNECTED &&
+        sync_timer_elapsed32(postsleep_timer) >= WLS_POSTSLEEP_RESYNC_DELAY) {
+        postsleep_timer = sync_timer_read32();
+
+        if (++postsleep_count >= WLS_POSTSLEEP_RESYNC_COUNT) {
+            postsleep_resync = false;
+        }
+
+#ifdef NKRO_ENABLE
+        extern keymap_config_t keymap_config;
+        if (keyboard_protocol && keymap_config.nkro) {
+            nkro_report_dedup_invalidate();
+        } else
+#endif
+        {
+            keyboard_report_dedup_invalidate();
+        }
+
+        extern report_keyboard_t *keyboard_report;
+#ifdef NKRO_ENABLE
+        extern report_nkro_t *nkro_report;
+        if (keyboard_protocol && keymap_config.nkro) {
+            host_nkro_send(nkro_report);
+        } else
+#endif
+        {
+            host_keyboard_send(keyboard_report);
+        }
+    }
+
+    /* Periodic keep-alive: re-send the current keyboard state to prevent
+     * the 2.4GHz radio link and dongle USB from entering power-saving
+     * modes.  This replaces the reactive idle-detection resync which
+     * failed to reliably recover the first report after idle.
+     *
+     * Does NOT reset the input activity timer, so the normal 5-minute
+     * sleep timeout still works as designed.
+     */
+    if (get_transport() == TRANSPORT_WLS &&
+        *md_getp_state() == MD_STATE_CONNECTED &&
+        lpwr_get_state() == LPWR_NORMAL &&
+        sync_timer_elapsed32(keepalive_timer) >= WLS_KEEPALIVE_INTERVAL) {
+
+        keepalive_timer = sync_timer_read32();
+
+        extern report_keyboard_t *keyboard_report;
+#ifdef NKRO_ENABLE
+        extern report_nkro_t *nkro_report;
+        extern keymap_config_t keymap_config;
+        if (keyboard_protocol && keymap_config.nkro) {
+            host_nkro_send(nkro_report);
+        } else
+#endif
+        {
+            host_keyboard_send(keyboard_report);
+        }
+    }
 
     /* usb_remote_wakeup() should be invoked last so that we have chance
      * to switch to wireless after start-up when usb is not connected
